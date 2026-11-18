@@ -1,0 +1,260 @@
+#pragma once
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <numeric>
+#include <span>
+#include <stdexcept>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace pkmc
+{
+
+using node_t = std::uint32_t;
+using word_t = std::uint64_t;
+using edge_t = std::vector<node_t>;
+inline constexpr std::size_t WordBits = 64;
+
+namespace detail
+{
+
+class Graph
+{
+public:
+  explicit Graph(std::vector<node_t> vertices)
+    : vertices_(std::move(vertices)), words_((vertices_.size() + WordBits - 1) / WordBits)
+  {
+    if(words_ && vertices_.size() > adjacency_.max_size() / words_) {
+      throw std::length_error("PKMC adjacency matrix is too large");
+    }
+    adjacency_.assign(vertices_.size() * words_, 0);
+  }
+
+  std::size_t size() const noexcept
+  {
+    return vertices_.size();
+  }
+
+  node_t vertex(node_t local) const noexcept
+  {
+    return vertices_[local];
+  }
+
+  std::span<word_t> adjacency(node_t local) noexcept
+  {
+    return std::span(adjacency_).subspan(std::size_t(local) * words_, words_);
+  }
+
+  std::span<const word_t> adjacency(node_t local) const noexcept
+  {
+    return std::span(adjacency_).subspan(std::size_t(local) * words_, words_);
+  }
+
+  bool is_edge(node_t first, node_t second) const noexcept
+  {
+    return adjacency(first)[second / WordBits] & (word_t{1} << (second % WordBits));
+  }
+
+  void add_edge(node_t first, node_t second) noexcept
+  {
+    adjacency(first)[second / WordBits] |= word_t{1} << (second % WordBits);
+    adjacency(second)[first / WordBits] |= word_t{1} << (first % WordBits);
+  }
+
+private:
+  std::vector<node_t> vertices_;
+  std::size_t words_;
+  std::vector<word_t> adjacency_;
+};
+
+struct FaceHash
+{
+  std::size_t operator()(std::span<const node_t> face) const noexcept
+  {
+    std::size_t hash = 0;
+    for(node_t vertex : face) {
+      hash ^= std::size_t(vertex) + 0x9e3779b9U + (hash << 6) + (hash >> 2);
+    }
+    return hash;
+  }
+
+  std::size_t operator()(const edge_t &face) const noexcept
+  {
+    return (*this)(std::span<const node_t>(face));
+  }
+};
+
+class Neighbors
+{
+public:
+  void add(node_t vertex)
+  {
+    sparse_.push_back(vertex);
+  }
+
+  void pack(std::size_t vertex_count)
+  {
+    std::sort(sparse_.begin(), sparse_.end());
+    const auto words = (vertex_count + WordBits - 1) / WordBits;
+    if(sparse_.size() > words * sizeof(word_t) / sizeof(node_t)) {
+      dense_.assign(words, 0);
+      for(node_t vertex : sparse_) {
+        dense_[vertex / WordBits] |= word_t{1} << (vertex % WordBits);
+      }
+      std::vector<node_t>().swap(sparse_);
+    }
+  }
+
+  bool contains(node_t vertex) const noexcept
+  {
+    return dense_.empty() ? std::binary_search(sparse_.begin(), sparse_.end(), vertex)
+                          : bool(dense_[vertex / WordBits] & (word_t{1} << (vertex % WordBits)));
+  }
+
+private:
+  std::vector<node_t> sparse_;
+  std::vector<word_t> dense_;
+};
+
+template <class Callback>
+bool combinations(std::span<const node_t> vertices, std::size_t count, Callback callback)
+{
+  if(count > vertices.size()) {
+    return true;
+  }
+  edge_t face(count);
+  const auto visit = [&](auto &&self, std::size_t start, std::size_t depth) -> bool {
+    if(depth == count) {
+      return callback(face);
+    }
+    for(std::size_t i = start; i <= vertices.size() - (count - depth); ++i) {
+      face[depth] = vertices[i];
+      if(!self(self, i + 1, depth + 1)) {
+        return false;
+      }
+    }
+    return true;
+  };
+  return visit(visit, 0, 0);
+}
+
+}
+
+class Hypergraph
+{
+public:
+  Hypergraph(node_t vertex_count, std::size_t order, std::span<const edge_t> edges)
+    : order_(order), edges_(edges.begin(), edges.end()), incidence_(vertex_count, 0),
+      projection_(vertices(vertex_count))
+  {
+    if(order < 2) {
+      throw std::invalid_argument("PKMC requires order >= 2");
+    }
+    for(auto &edge : edges_) {
+      if(edge.size() != order_) {
+        throw std::invalid_argument("Nonuniform PKMC edge");
+      }
+      std::sort(edge.begin(), edge.end());
+      if(edge.back() >= vertex_count) {
+        throw std::out_of_range("PKMC vertex out of range");
+      }
+      if(std::adjacent_find(edge.begin(), edge.end()) != edge.end()) {
+        throw std::invalid_argument("Repeated vertex in PKMC edge");
+      }
+    }
+    std::sort(edges_.begin(), edges_.end());
+    edges_.erase(std::unique(edges_.begin(), edges_.end()), edges_.end());
+    edge_t face;
+    face.reserve(order_ <= vertex_count ? order_ - 1 : 0);
+    for(const auto &edge : edges_) {
+      for(std::size_t i = 0; i < order_; ++i) {
+        ++incidence_[edge[i]];
+        for(std::size_t j = i + 1; j < order_; ++j) {
+          projection_.add_edge(edge[i], edge[j]);
+        }
+        face.clear();
+        for(std::size_t j = 0; j < order_; ++j) {
+          if(j != i) {
+            face.push_back(edge[j]);
+          }
+        }
+        links_[face].add(edge[i]);
+      }
+    }
+    for(auto &[key, neighbors] : links_) {
+      neighbors.pack(vertex_count);
+    }
+  }
+
+  std::size_t size() const noexcept
+  {
+    return incidence_.size();
+  }
+
+  std::size_t order() const noexcept
+  {
+    return order_;
+  }
+
+  const std::vector<edge_t> &edges() const noexcept
+  {
+    return edges_;
+  }
+
+  std::size_t incidence(node_t vertex) const noexcept
+  {
+    return incidence_[vertex];
+  }
+
+  const detail::Graph &projection() const noexcept
+  {
+    return projection_;
+  }
+
+  const detail::Neighbors *link(const edge_t &sorted_face) const
+  {
+    const auto it = links_.find(sorted_face);
+    return it == links_.end() ? nullptr : &it->second;
+  }
+
+  bool is_clique(std::span<const node_t> clique) const
+  {
+    edge_t sorted(clique.begin(), clique.end());
+    std::sort(sorted.begin(), sorted.end());
+    if((!sorted.empty() && sorted.back() >= size()) ||
+       std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+      return false;
+    }
+    return detail::combinations(sorted, order_,
+      [&](const edge_t &edge) { return std::binary_search(edges_.begin(), edges_.end(), edge); });
+  }
+
+  // The caller supplies an existing clique and a distinct, in-range vertex.
+  bool can_extend(std::span<const node_t> clique, node_t vertex) const
+  {
+    return detail::combinations(clique, order_ - 1, [&](edge_t face) {
+      std::sort(face.begin(), face.end());
+      const auto *neighbors = link(face);
+      return neighbors && neighbors->contains(vertex);
+    });
+  }
+
+private:
+  static std::vector<node_t> vertices(node_t count)
+  {
+    std::vector<node_t> result(count);
+    std::iota(result.begin(), result.end(), node_t{0});
+    return result;
+  }
+
+  std::size_t order_;
+  std::vector<edge_t> edges_;
+  std::vector<std::size_t> incidence_;
+  detail::Graph projection_;
+  std::unordered_map<edge_t, detail::Neighbors, detail::FaceHash> links_;
+};
+
+}
