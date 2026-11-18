@@ -1,4 +1,4 @@
-#include "clique_solver.h"
+#pragma once
 
 #include <algorithm>
 #include <bit>
@@ -9,12 +9,12 @@
 
 namespace pkmc
 {
-namespace
+namespace detail
 {
 
-constexpr node_t None = std::numeric_limits<node_t>::max();
+inline constexpr node_t None = std::numeric_limits<node_t>::max();
 
-bool binomial_exceeds(std::size_t n, std::size_t k, std::size_t limit)
+inline bool binomial_exceeds(std::size_t n, std::size_t k, std::size_t limit)
 {
   if(k > n) {
     return false;
@@ -38,7 +38,8 @@ bool binomial_exceeds(std::size_t n, std::size_t k, std::size_t limit)
 
 }
 
-void CliqueSolver::update_best(std::span<const node_t> clique)
+template <std::size_t K>
+void CliqueSolver<K>::update_best(std::span<const node_t> clique)
 {
   if(clique.size() <= best_size_.load(std::memory_order_relaxed)) {
     return;
@@ -52,7 +53,8 @@ void CliqueSolver::update_best(std::span<const node_t> clique)
   best_size_.store(clique.size(), std::memory_order_relaxed);
 }
 
-std::vector<node_t> CliqueSolver::search(unsigned thread_count)
+template <std::size_t K>
+std::vector<node_t> CliqueSolver<K>::search(unsigned thread_count)
 {
   statistics_ = {};
   best_size_ = 0;
@@ -62,7 +64,7 @@ std::vector<node_t> CliqueSolver::search(unsigned thread_count)
   done_ = false;
   const auto &projection = graph_.projection();
 
-  std::vector<node_t> baseline(std::min(graph_.size(), graph_.order() - 1));
+  std::vector<node_t> baseline(std::min(graph_.size(), K - 1));
   std::iota(baseline.begin(), baseline.end(), node_t{0});
   update_best(baseline);
   if(!graph_.edges().empty()) {
@@ -74,17 +76,21 @@ std::vector<node_t> CliqueSolver::search(unsigned thread_count)
 
   support_bounds_.resize(graph_.size());
   for(std::size_t v = 0; v < graph_.size(); ++v) {
-    std::size_t low = graph_.order() - 1;
-    std::size_t high = graph_.size();
-    while(low < high) {
-      const auto middle = low + (high - low + 1) / 2;
-      if(binomial_exceeds(middle - 1, graph_.order() - 1, graph_.incidence(v))) {
-        high = middle - 1;
-      } else {
-        low = middle;
+    if constexpr(K == 2) {
+      support_bounds_[v] = graph_.incidence(v) + 1;
+    } else {
+      std::size_t low = K - 1;
+      std::size_t high = graph_.size();
+      while(low < high) {
+        const auto middle = low + (high - low + 1) / 2;
+        if(detail::binomial_exceeds(middle - 1, K - 1, graph_.incidence(v))) {
+          high = middle - 1;
+        } else {
+          low = middle;
+        }
       }
+      support_bounds_[v] = low;
     }
-    support_bounds_[v] = low;
   }
   has_global_universals_ =
     std::ranges::find(support_bounds_, graph_.size()) != support_bounds_.end();
@@ -106,9 +112,12 @@ std::vector<node_t> CliqueSolver::search(unsigned thread_count)
     for(node_t local : order) {
       const auto vertex = projection.vertex(local);
       if(vertex != greedy.front() &&
-         std::ranges::all_of(greedy, [&](node_t v) { return projection.is_edge(vertex, v); }) &&
-         graph_.can_extend(greedy, vertex)) {
-        greedy.push_back(vertex);
+         std::ranges::all_of(greedy, [&](node_t v) { return projection.is_edge(vertex, v); })) {
+        if constexpr(K == 2) {
+          greedy.push_back(vertex);
+        } else if(graph_.can_extend(greedy, vertex)) {
+          greedy.push_back(vertex);
+        }
       }
     }
     update_best(greedy);
@@ -203,7 +212,8 @@ std::vector<node_t> CliqueSolver::search(unsigned thread_count)
   return best_clique_;
 }
 
-std::vector<node_t> CliqueSolver::prepare_candidates(const detail::Graph &graph,
+template <std::size_t K>
+std::vector<node_t> CliqueSolver<K>::prepare_candidates(const detail::Graph &graph,
   std::vector<node_t> &candidates,
   std::size_t clique_size,
   Workspace &workspace)
@@ -310,7 +320,8 @@ std::vector<node_t> CliqueSolver::prepare_candidates(const detail::Graph &graph,
   return bounds;
 }
 
-detail::Graph CliqueSolver::child_graph(const detail::Graph &parent,
+template <std::size_t K>
+detail::Graph CliqueSolver<K>::child_graph(const detail::Graph &parent,
   std::span<const node_t> candidates,
   std::span<const node_t> clique,
   node_t selected) const
@@ -328,42 +339,45 @@ detail::Graph CliqueSolver::child_graph(const detail::Graph &parent,
       }
     }
   }
-  if(graph_.order() == 2 || child.size() < 2) {
-    return child;
-  }
-
-  detail::combinations(clique, graph_.order() - 3, [&](edge_t base) {
-    base.push_back(parent.vertex(selected));
-    base.push_back(0);
-    edge_t face(base.size());
-    for(std::size_t i = 0; i < child.size(); ++i) {
-      base.back() = child.vertex(i);
+  if constexpr(K > 2) {
+    if(child.size() < 2) {
+      return child;
+    }
+    edge_t<K - 3> base{};
+    detail::combinations(clique, base, [&] {
+      edge_t<K - 1> face{};
       std::copy(base.begin(), base.end(), face.begin());
-      std::sort(face.begin(), face.end());
-      const auto *neighbors = graph_.link(face);
-      auto row = child.adjacency(i);
-      if(!neighbors) {
-        std::fill(row.begin(), row.end(), 0);
-        continue;
-      }
-      for(std::size_t w = 0; w < row.size(); ++w) {
-        auto bits = row[w];
-        while(bits) {
-          const auto offset = std::countr_zero(bits);
-          const node_t j = w * WordBits + offset;
-          if(!neighbors->contains(child.vertex(j))) {
-            row[w] &= ~(word_t{1} << offset);
+      face[K - 3] = parent.vertex(selected);
+      for(std::size_t i = 0; i < child.size(); ++i) {
+        face.back() = child.vertex(i);
+        auto sorted_face = face;
+        std::sort(sorted_face.begin(), sorted_face.end());
+        const auto *neighbors = graph_.link(sorted_face);
+        auto row = child.adjacency(i);
+        if(!neighbors) {
+          std::fill(row.begin(), row.end(), 0);
+          continue;
+        }
+        for(std::size_t w = 0; w < row.size(); ++w) {
+          auto bits = row[w];
+          while(bits) {
+            const auto offset = std::countr_zero(bits);
+            const node_t j = w * WordBits + offset;
+            if(!neighbors->contains(child.vertex(j))) {
+              row[w] &= ~(word_t{1} << offset);
+            }
+            bits &= bits - 1;
           }
-          bits &= bits - 1;
         }
       }
-    }
-    return true;
-  });
+      return true;
+    });
+  }
   return child;
 }
 
-void CliqueSolver::prune_singletons(const detail::Graph &graph,
+template <std::size_t K>
+void CliqueSolver<K>::prune_singletons(const detail::Graph &graph,
   std::vector<node_t> &candidates,
   std::vector<node_t> &bounds,
   std::span<const node_t> clique,
@@ -387,7 +401,10 @@ void CliqueSolver::prune_singletons(const detail::Graph &graph,
     singleton_mask[v / WordBits] |= word_t{1} << (v % WordBits);
   }
   std::vector<bool> removed(graph.size(), false);
-  std::vector<bool> used(graph.size());
+  std::vector<bool> used;
+  if constexpr(K > 2) {
+    used.resize(graph.size());
+  }
   for(node_t x : candidates) {
     std::size_t packed = 0;
     const auto row = graph.adjacency(x);
@@ -398,61 +415,65 @@ void CliqueSolver::prune_singletons(const detail::Graph &graph,
       }
       packed += std::popcount(conflicts);
     }
-    if(packed <= slack && budget && graph_.order() > 2) {
-      std::fill(used.begin(), used.end(), false);
-      for(node_t v : singletons) {
-        used[v] = v == x || !graph.is_edge(x, v);
-      }
-    }
-    for(std::size_t r = 2;
-        packed <= slack && budget && r < graph_.order() && r <= singletons.size(); ++r) {
-      if(graph_.order() - 1 - r > clique.size()) {
-        continue;
-      }
-      bool insufficient = false;
-      while(packed <= slack && budget) {
-        std::vector<node_t> available;
+    if constexpr(K > 2) {
+      if(packed <= slack && budget) {
+        std::fill(used.begin(), used.end(), false);
         for(node_t v : singletons) {
-          if(!used[v]) {
-            available.push_back(v);
-          }
-        }
-        if(available.size() / r <= slack - packed) {
-          insufficient = true;
-          break;
-        }
-        bool found = false;
-        detail::combinations(available, r, [&](const edge_t &subset) {
-          bool missing = false;
-          detail::combinations(clique, graph_.order() - 1 - r, [&](edge_t face) {
-            if(!budget) {
-              return false;
-            }
-            --budget;
-            ++statistics.reduction_lookups;
-            for(node_t v : subset) {
-              face.push_back(graph.vertex(v));
-            }
-            std::sort(face.begin(), face.end());
-            const auto *neighbors = graph_.link(face);
-            missing = !neighbors || !neighbors->contains(graph.vertex(x));
-            return !missing;
-          });
-          if(missing) {
-            for(node_t v : subset) {
-              used[v] = true;
-            }
-            ++packed;
-            found = true;
-          }
-          return !found && budget;
-        });
-        if(!found) {
-          break;
+          used[v] = v == x || !graph.is_edge(x, v);
         }
       }
-      if(insufficient) {
-        break;
+      for(std::size_t r = 2; packed <= slack && budget && r < K && r <= singletons.size(); ++r) {
+        if(K - 1 - r > clique.size()) {
+          continue;
+        }
+        bool insufficient = false;
+        while(packed <= slack && budget) {
+          std::vector<node_t> available;
+          for(node_t v : singletons) {
+            if(!used[v]) {
+              available.push_back(v);
+            }
+          }
+          if(available.size() / r <= slack - packed) {
+            insufficient = true;
+            break;
+          }
+          bool found = false;
+          edge_t<K - 1> subset{};
+          detail::combinations(available, std::span(subset).first(r), [&] {
+            bool missing = false;
+            edge_t<K - 1> face{};
+            detail::combinations(clique, std::span(face).first(K - 1 - r), [&] {
+              if(!budget) {
+                return false;
+              }
+              --budget;
+              ++statistics.reduction_lookups;
+              auto sorted_face = face;
+              for(std::size_t i = 0; i < r; ++i) {
+                sorted_face[K - 1 - r + i] = graph.vertex(subset[i]);
+              }
+              std::sort(sorted_face.begin(), sorted_face.end());
+              const auto *neighbors = graph_.link(sorted_face);
+              missing = !neighbors || !neighbors->contains(graph.vertex(x));
+              return !missing;
+            });
+            if(missing) {
+              for(node_t v : std::span(subset).first(r)) {
+                used[v] = true;
+              }
+              ++packed;
+              found = true;
+            }
+            return !found && budget;
+          });
+          if(!found) {
+            break;
+          }
+        }
+        if(insufficient) {
+          break;
+        }
       }
     }
     if(packed > slack) {
@@ -478,7 +499,8 @@ void CliqueSolver::prune_singletons(const detail::Graph &graph,
   bounds.resize(retained);
 }
 
-node_t CliqueSolver::try_forcing(const detail::Graph &graph,
+template <std::size_t K>
+node_t CliqueSolver<K>::try_forcing(const detail::Graph &graph,
   std::span<const node_t> candidates,
   std::span<const node_t> clique,
   std::size_t &budget,
@@ -496,14 +518,14 @@ node_t CliqueSolver::try_forcing(const detail::Graph &graph,
     }
   }
   if(!options_.universal_reduction && !options_.exchange_reduction) {
-    return None;
+    return detail::None;
   }
   std::vector<word_t> active((graph.size() + WordBits - 1) / WordBits, 0);
   for(node_t v : candidates) {
     active[v / WordBits] |= word_t{1} << (v % WordBits);
   }
   for(node_t v : candidates) {
-    node_t exception = None;
+    node_t exception = detail::None;
     bool multiple = false;
     const auto row = graph.adjacency(v);
     for(std::size_t w = 0; w < active.size(); ++w) {
@@ -514,7 +536,8 @@ node_t CliqueSolver::try_forcing(const detail::Graph &graph,
       if(!conflicts) {
         continue;
       }
-      if(exception != None || !options_.exchange_reduction || std::popcount(conflicts) > 1) {
+      if(exception != detail::None || !options_.exchange_reduction ||
+         std::popcount(conflicts) > 1) {
         multiple = true;
         break;
       }
@@ -523,8 +546,8 @@ node_t CliqueSolver::try_forcing(const detail::Graph &graph,
     if(multiple) {
       continue;
     }
-    if(graph_.order() == 2) {
-      universal = exception == None;
+    if constexpr(K == 2) {
+      universal = exception == detail::None;
       if(universal && !options_.universal_reduction) {
         continue;
       }
@@ -533,7 +556,7 @@ node_t CliqueSolver::try_forcing(const detail::Graph &graph,
         continue;
       }
       const auto excluded = options_.exchange_reduction ? 2 : 1;
-      if(binomial_exceeds(clique.size() + candidates.size() - excluded, graph_.order() - 1,
+      if(detail::binomial_exceeds(clique.size() + candidates.size() - excluded, K - 1,
            graph_.incidence(graph.vertex(v)))) {
         continue;
       }
@@ -543,46 +566,54 @@ node_t CliqueSolver::try_forcing(const detail::Graph &graph,
           others.push_back(u);
         }
       }
-      std::vector<node_t> common;
+      edge_t<K - 1> common{};
+      std::size_t common_size = 0;
       bool missing = false;
       bool complete = true;
-      for(std::size_t r = 2; complete && r < graph_.order() && r <= others.size(); ++r) {
-        if(graph_.order() - 1 - r > clique.size()) {
+      for(std::size_t r = 2; complete && r < K && r <= others.size(); ++r) {
+        if(K - 1 - r > clique.size()) {
           continue;
         }
-        complete = detail::combinations(others, r, [&](const edge_t &subset) {
-          return detail::combinations(clique, graph_.order() - 1 - r, [&](edge_t face) {
+        edge_t<K - 1> subset{};
+        complete = detail::combinations(others, std::span(subset).first(r), [&] {
+          edge_t<K - 1> face{};
+          return detail::combinations(clique, std::span(face).first(K - 1 - r), [&] {
             if(!budget) {
               return false;
             }
             --budget;
             ++statistics.reduction_lookups;
-            for(node_t u : subset) {
-              face.push_back(graph.vertex(u));
+            auto sorted_face = face;
+            for(std::size_t i = 0; i < r; ++i) {
+              sorted_face[K - 1 - r + i] = graph.vertex(subset[i]);
             }
-            std::sort(face.begin(), face.end());
-            const auto *neighbors = graph_.link(face);
+            std::sort(sorted_face.begin(), sorted_face.end());
+            const auto *neighbors = graph_.link(sorted_face);
             if(neighbors && neighbors->contains(graph.vertex(v))) {
               return true;
             }
-            if(exception != None || !options_.exchange_reduction) {
+            if(exception != detail::None || !options_.exchange_reduction) {
               return false;
             }
             if(!missing) {
-              common = subset;
+              std::copy_n(subset.begin(), r, common.begin());
+              common_size = r;
               missing = true;
             } else {
-              std::erase_if(
-                common, [&](node_t u) { return std::ranges::find(subset, u) == subset.end(); });
+              const auto selected = std::span(subset).first(r);
+              common_size =
+                std::remove_if(common.begin(), common.begin() + common_size,
+                  [&](node_t u) { return std::ranges::find(selected, u) == selected.end(); }) -
+                common.begin();
             }
-            return !common.empty();
+            return common_size != 0;
           });
         });
       }
       if(!complete) {
         continue;
       }
-      universal = exception == None && !missing;
+      universal = exception == detail::None && !missing;
       if(universal && !options_.universal_reduction) {
         continue;
       }
@@ -594,10 +625,12 @@ node_t CliqueSolver::try_forcing(const detail::Graph &graph,
     }
     return v;
   }
-  return None;
+  return detail::None;
 }
 
-void CliqueSolver::dispatch(detail::Graph graph, std::vector<node_t> &clique, Workspace &workspace)
+template <std::size_t K>
+void CliqueSolver<K>::dispatch(
+  detail::Graph graph, std::vector<node_t> &clique, Workspace &workspace)
 {
   if(idle_.load(std::memory_order_relaxed)) {
     std::unique_lock lock(jobs_mutex_);
@@ -611,7 +644,8 @@ void CliqueSolver::dispatch(detail::Graph graph, std::vector<node_t> &clique, Wo
   branch(graph, clique, workspace);
 }
 
-void CliqueSolver::branch(
+template <std::size_t K>
+void CliqueSolver<K>::branch(
   const detail::Graph &graph, std::vector<node_t> &clique, Workspace &workspace)
 {
   ++workspace.statistics.nodes;
@@ -642,8 +676,8 @@ void CliqueSolver::branch(
       options_.universal_reduction || options_.exchange_reduction ||
           (options_.global_universal_reduction && has_global_universals_)
         ? try_forcing(graph, candidates, clique, reduction_budget, universal, workspace.statistics)
-        : None;
-    if(forced != None) {
+        : detail::None;
+    if(forced != detail::None) {
       if(universal) {
         const auto index = std::ranges::find(candidates, forced) - candidates.begin();
         const auto color = bounds[index];
@@ -701,10 +735,11 @@ void CliqueSolver::branch(
   clique.resize(entry_size);
 }
 
+template <std::size_t K>
 std::vector<node_t> maximum_clique(
-  const Hypergraph &graph, unsigned thread_count, SearchOptions options)
+  const Hypergraph<K> &graph, unsigned thread_count, SearchOptions options)
 {
-  return CliqueSolver(graph, options).search(thread_count);
+  return CliqueSolver<K>(graph, options).search(thread_count);
 }
 
 }

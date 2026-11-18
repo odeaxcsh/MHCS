@@ -32,13 +32,15 @@ struct SearchStatistics
   std::uint64_t reduction_lookups = 0;
 };
 
+template <std::size_t K>
 std::vector<node_t> maximum_clique(
-  const Hypergraph &graph, unsigned thread_count = 4, SearchOptions options = {});
+  const Hypergraph<K> &graph, unsigned thread_count = 4, SearchOptions options = {});
 
+template <std::size_t K>
 class CliqueSolver
 {
 public:
-  explicit CliqueSolver(const Hypergraph &graph, SearchOptions options = {})
+  explicit CliqueSolver(const Hypergraph<K> &graph, SearchOptions options = {})
     : graph_(graph), options_(options)
   {
   }
@@ -99,7 +101,7 @@ private:
 
   void dispatch(detail::Graph graph, std::vector<node_t> &clique, Workspace &workspace);
 
-  const Hypergraph &graph_;
+  const Hypergraph<K> &graph_;
   SearchOptions options_;
   SearchStatistics statistics_;
   bool has_global_universals_ = false;
@@ -118,3 +120,5 @@ private:
 };
 
 }
+
+#include "clique_solver.tpp"

@@ -1,11 +1,13 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <numeric>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -15,7 +17,8 @@ namespace pkmc
 
 using node_t = std::uint32_t;
 using word_t = std::uint64_t;
-using edge_t = std::vector<node_t>;
+template <std::size_t K>
+using edge_t = std::array<node_t, K>;
 inline constexpr std::size_t WordBits = 64;
 
 namespace detail
@@ -72,7 +75,8 @@ private:
 
 struct FaceHash
 {
-  std::size_t operator()(std::span<const node_t> face) const noexcept
+  template <std::size_t N>
+  std::size_t operator()(const edge_t<N> &face) const noexcept
   {
     std::size_t hash = 0;
     for(node_t vertex : face) {
@@ -80,11 +84,10 @@ struct FaceHash
     }
     return hash;
   }
+};
 
-  std::size_t operator()(const edge_t &face) const noexcept
-  {
-    return (*this)(std::span<const node_t>(face));
-  }
+struct NoLinks
+{
 };
 
 class Neighbors
@@ -120,15 +123,15 @@ private:
 };
 
 template <class Callback>
-bool combinations(std::span<const node_t> vertices, std::size_t count, Callback callback)
+bool combinations(std::span<const node_t> vertices, std::span<node_t> face, Callback callback)
 {
+  const auto count = face.size();
   if(count > vertices.size()) {
     return true;
   }
-  edge_t face(count);
   const auto visit = [&](auto &&self, std::size_t start, std::size_t depth) -> bool {
     if(depth == count) {
-      return callback(face);
+      return callback();
     }
     for(std::size_t i = start; i <= vertices.size() - (count - depth); ++i) {
       face[depth] = vertices[i];
@@ -143,20 +146,20 @@ bool combinations(std::span<const node_t> vertices, std::size_t count, Callback 
 
 }
 
+template <std::size_t K>
 class Hypergraph
 {
+  static_assert(K >= 2, "PKMC requires K >= 2");
+
 public:
-  Hypergraph(node_t vertex_count, std::size_t order, std::span<const edge_t> edges)
-    : order_(order), edges_(edges.begin(), edges.end()), incidence_(vertex_count, 0),
+  using edge_type = edge_t<K>;
+  using face_type = edge_t<K - 1>;
+
+  Hypergraph(node_t vertex_count, std::span<const edge_type> edges)
+    : edges_(edges.begin(), edges.end()), incidence_(vertex_count, 0),
       projection_(vertices(vertex_count))
   {
-    if(order < 2) {
-      throw std::invalid_argument("PKMC requires order >= 2");
-    }
     for(auto &edge : edges_) {
-      if(edge.size() != order_) {
-        throw std::invalid_argument("Nonuniform PKMC edge");
-      }
       std::sort(edge.begin(), edge.end());
       if(edge.back() >= vertex_count) {
         throw std::out_of_range("PKMC vertex out of range");
@@ -167,25 +170,27 @@ public:
     }
     std::sort(edges_.begin(), edges_.end());
     edges_.erase(std::unique(edges_.begin(), edges_.end()), edges_.end());
-    edge_t face;
-    face.reserve(order_ <= vertex_count ? order_ - 1 : 0);
     for(const auto &edge : edges_) {
-      for(std::size_t i = 0; i < order_; ++i) {
+      for(std::size_t i = 0; i < K; ++i) {
         ++incidence_[edge[i]];
-        for(std::size_t j = i + 1; j < order_; ++j) {
+        for(std::size_t j = i + 1; j < K; ++j) {
           projection_.add_edge(edge[i], edge[j]);
         }
-        face.clear();
-        for(std::size_t j = 0; j < order_; ++j) {
-          if(j != i) {
-            face.push_back(edge[j]);
+        if constexpr(K > 2) {
+          face_type face{};
+          for(std::size_t j = 0, index = 0; j < K; ++j) {
+            if(j != i) {
+              face[index++] = edge[j];
+            }
           }
+          links_[face].add(edge[i]);
         }
-        links_[face].add(edge[i]);
       }
     }
-    for(auto &[key, neighbors] : links_) {
-      neighbors.pack(vertex_count);
+    if constexpr(K > 2) {
+      for(auto &[key, neighbors] : links_) {
+        neighbors.pack(vertex_count);
+      }
     }
   }
 
@@ -194,12 +199,12 @@ public:
     return incidence_.size();
   }
 
-  std::size_t order() const noexcept
+  static constexpr std::size_t order() noexcept
   {
-    return order_;
+    return K;
   }
 
-  const std::vector<edge_t> &edges() const noexcept
+  const std::vector<edge_type> &edges() const noexcept
   {
     return edges_;
   }
@@ -214,7 +219,7 @@ public:
     return projection_;
   }
 
-  const detail::Neighbors *link(const edge_t &sorted_face) const
+  const detail::Neighbors *link(const face_type &sorted_face) const requires(K > 2)
   {
     const auto it = links_.find(sorted_face);
     return it == links_.end() ? nullptr : &it->second;
@@ -222,24 +227,37 @@ public:
 
   bool is_clique(std::span<const node_t> clique) const
   {
-    edge_t sorted(clique.begin(), clique.end());
+    std::vector<node_t> sorted(clique.begin(), clique.end());
     std::sort(sorted.begin(), sorted.end());
     if((!sorted.empty() && sorted.back() >= size()) ||
        std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
       return false;
     }
-    return detail::combinations(sorted, order_,
-      [&](const edge_t &edge) { return std::binary_search(edges_.begin(), edges_.end(), edge); });
+    edge_type edge{};
+    return detail::combinations(sorted, edge, [&] {
+      if constexpr(K == 2) {
+        return projection_.is_edge(edge[0], edge[1]);
+      } else {
+        return std::binary_search(edges_.begin(), edges_.end(), edge);
+      }
+    });
   }
 
   // The caller supplies an existing clique and a distinct, in-range vertex.
   bool can_extend(std::span<const node_t> clique, node_t vertex) const
   {
-    return detail::combinations(clique, order_ - 1, [&](edge_t face) {
-      std::sort(face.begin(), face.end());
-      const auto *neighbors = link(face);
-      return neighbors && neighbors->contains(vertex);
-    });
+    if constexpr(K == 2) {
+      return std::ranges::all_of(
+        clique, [&](node_t selected) { return projection_.is_edge(selected, vertex); });
+    } else {
+      face_type face{};
+      return detail::combinations(clique, face, [&] {
+        auto sorted_face = face;
+        std::sort(sorted_face.begin(), sorted_face.end());
+        const auto *neighbors = link(sorted_face);
+        return neighbors && neighbors->contains(vertex);
+      });
+    }
   }
 
 private:
@@ -250,11 +268,13 @@ private:
     return result;
   }
 
-  std::size_t order_;
-  std::vector<edge_t> edges_;
+  std::vector<edge_type> edges_;
   std::vector<std::size_t> incidence_;
   detail::Graph projection_;
-  std::unordered_map<edge_t, detail::Neighbors, detail::FaceHash> links_;
+  [[no_unique_address]] std::conditional_t<K == 2,
+    detail::NoLinks,
+    std::unordered_map<face_type, detail::Neighbors, detail::FaceHash>>
+    links_;
 };
 
 }
